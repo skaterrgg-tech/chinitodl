@@ -103,6 +103,8 @@ app.get('/api/info', (req, res) => {
     '--dump-json',
     '--no-playlist',
     '--no-warnings',
+    // Use TV/iOS client to bypass server-IP blocks from YouTube
+    ...(platform === 'youtube' ? ['--extractor-args', 'youtube:player_client=tv,ios,web'] : []),
     ...getCookieArgs(platform),
     url
   ]);
@@ -199,6 +201,7 @@ app.post('/api/download', (req, res) => {
     '--no-warnings',
     '-f', formatArg,
     '-o', outputTemplate,
+    ...(platform === 'youtube' ? ['--extractor-args', 'youtube:player_client=tv,ios,web'] : []),
     ...getCookieArgs(platform)
   ];
 
