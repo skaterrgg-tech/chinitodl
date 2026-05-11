@@ -186,7 +186,12 @@ async function startDownload() {
 
     if (!res.ok) {
       const data = await res.json().catch(() => ({}));
-      showError(data.error || 'Error al descargar');
+      if (data.needsCookies) {
+        showError(data.error || 'YouTube bloqueó la descarga');
+        document.getElementById('cookiesModal').hidden = false;
+      } else {
+        showError(data.error || 'Error al descargar');
+      }
       return;
     }
 
@@ -230,6 +235,18 @@ function resetVideoState() {
   state.downloading = false;
   downloadBtn.disabled = false;
 }
+
+/* ─── Cookies modal ───────────────────────────────────── */
+document.getElementById('cookiesModalClose').addEventListener('click', () => {
+  document.getElementById('cookiesModal').hidden = true;
+});
+document.getElementById('cookiesModalOk').addEventListener('click', () => {
+  document.getElementById('cookiesModal').hidden = true;
+});
+document.getElementById('cookiesModal').addEventListener('click', e => {
+  if (e.target === document.getElementById('cookiesModal'))
+    document.getElementById('cookiesModal').hidden = true;
+});
 
 function escHtml(s) {
   return String(s)

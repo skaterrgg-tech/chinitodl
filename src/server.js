@@ -4,6 +4,7 @@ const fs = require('fs');
 const path = require('path');
 const os = require('os');
 const crypto = require('crypto');
+const { Readable } = require('stream');
 
 process.env.PATH = ['/opt/homebrew/bin', '/opt/homebrew/sbin', '/usr/local/bin', '/usr/bin', '/bin', process.env.PATH].filter(Boolean).join(':');
 
@@ -80,31 +81,10 @@ function getCookieArgs(platform) {
 function getBaseArgs(platform) {
   const args = ['--no-playlist', '--no-warnings'];
   if (platform === 'youtube') {
-    args.push('--extractor-args', 'youtube:player_client=mweb,tv_embedded');
-    args.push('--user-agent', 'Mozilla/5.0 (Linux; Android 12; Pixel 6) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/112.0.0.0 Mobile Safari/537.36');
+    args.push('--extractor-args', 'youtube:player_client=tv_embedded,web_embedded,mweb');
+    args.push('--user-agent', 'Mozilla/5.0 (SMART-TV; Linux; Tizen 6.0) AppleWebKit/538.1 (KHTML, like Gecko) Version/6.0 TV Safari/538.1');
   }
   return args;
-}
-
-// ── Piped API (YouTube en servidor sin cookies) ─────────────
-const PIPED_INSTANCES = [
-  'https://pipedapi.kavin.rocks',
-  'https://piped-api.garudalinux.org',
-  'https://api.piped.projectsegfau.lt',
-  'https://pipedapi.in.projectsegfau.lt',
-];
-
-// Allowed hostnames for the stream proxy (security guard)
-const PROXY_ALLOWED_HOSTS = [
-  'googlevideo.com', 'youtube.com',
-  ...PIPED_INSTANCES.map(u => new URL(u).hostname),
-];
-
-function isAllowedProxyUrl(url) {
-  try {
-    const h = new URL(url).hostname;
-    return PROXY_ALLOWED_HOSTS.some(allowed => h === allowed || h.endsWith('.' + allowed));
-  } catch { return false; }
 }
 
 function extractYouTubeId(url) {
@@ -115,67 +95,34 @@ function extractYouTubeId(url) {
   } catch { return null; }
 }
 
-function parseHeight(qualityStr) {
-  if (!qualityStr) return null;
-  const m = qualityStr.match(/^(\d+)/);
-  return m ? parseInt(m[1]) : null;
-}
+// ── YouTube page scrape (no IP blocking, works everywhere) ───
+async function scrapeYouTubeInfo(url) {
+  const res = await fetch(url, {
+    headers: {
+      'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
+      'Accept-Language': 'en-US,en;q=0.9',
+      'Accept': 'text/html,application/xhtml+xml',
+    },
+    signal: AbortSignal.timeout(15000),
+  });
+  if (!res.ok) return null;
+  const html = await res.text();
 
-async function getPipedStreams(videoId) {
-  for (const instance of PIPED_INSTANCES) {
-    try {
-      const res = await fetch(`${instance}/streams/${videoId}`, {
-        headers: { 'User-Agent': 'Mozilla/5.0 (compatible; bot/1.0)' },
-        signal: AbortSignal.timeout(10000),
-      });
-      if (!res.ok) { console.log(`[Piped] ${instance} → ${res.status}`); continue; }
-      const data = await res.json();
-      if (data.error) { console.log(`[Piped] ${instance} error: ${data.error}`); continue; }
-      if (data.videoStreams?.length || data.audioStreams?.length) {
-        console.log(`[Piped] OK via ${instance}`);
-        return data;
-      }
-    } catch (e) {
-      console.log(`[Piped] ${instance} failed: ${e.message}`);
-    }
-  }
-  return null;
-}
-
-// ── Stream proxy (pipes YouTube CDN → client) ───────────────
-app.get('/api/stream', async (req, res) => {
-  const { url: rawUrl, filename } = req.query;
-  if (!rawUrl) return res.status(400).end();
-
-  const streamUrl = decodeURIComponent(rawUrl);
-  if (!isAllowedProxyUrl(streamUrl)) return res.status(403).json({ error: 'URL no permitida' });
+  const m = html.match(/ytInitialPlayerResponse\s*=\s*(\{.+?\})\s*;/s);
+  if (!m) return null;
 
   try {
-    const upstream = await fetch(streamUrl, {
-      headers: {
-        'User-Agent': 'Mozilla/5.0 (Linux; Android 12; Pixel 6) AppleWebKit/537.36',
-        'Referer': 'https://www.youtube.com/',
-        'Origin': 'https://www.youtube.com',
-      },
-      signal: AbortSignal.timeout(30000),
-    });
-
-    if (!upstream.ok) return res.status(upstream.status).json({ error: 'Error al obtener el stream' });
-
-    const ct = upstream.headers.get('content-type') || 'application/octet-stream';
-    const cl = upstream.headers.get('content-length');
-    res.setHeader('Content-Type', ct);
-    if (cl) res.setHeader('Content-Length', cl);
-    res.setHeader('Content-Disposition', `attachment; filename="${filename || 'descarga.mp4'}"`);
-    res.setHeader('Cache-Control', 'no-store');
-
-    const { Readable } = require('stream');
-    Readable.fromWeb(upstream.body).pipe(res);
-  } catch (e) {
-    console.error('[stream proxy]', e.message);
-    if (!res.headersSent) res.status(500).json({ error: 'Error al descargar' });
-  }
-});
+    const data = JSON.parse(m[1]);
+    if (data.playabilityStatus?.status !== 'OK') return null;
+    const d = data.videoDetails;
+    return {
+      title: d?.title || null,
+      thumbnail: d?.thumbnail?.thumbnails?.slice(-1)[0]?.url || null,
+      duration: parseInt(d?.lengthSeconds) || null,
+      uploader: d?.author || null,
+    };
+  } catch { return null; }
+}
 
 // ══════════════════════════════════════════════════════════
 // GET /api/info
@@ -186,37 +133,38 @@ app.get('/api/info', async (req, res) => {
 
   const platform = detectPlatform(url);
 
-  // ── YouTube en servidor: usar Piped API ─────────────────
-  if (platform === 'youtube' && IS_HEADLESS && !YT_COOKIES_FILE) {
-    const videoId = extractYouTubeId(url);
-    if (!videoId) return res.status(400).json({ error: 'URL de YouTube inválida' });
-
-    const piped = await getPipedStreams(videoId);
-    if (!piped) return res.status(400).json({ error: 'No se pudo obtener información del video. Intenta de nuevo.' });
-
-    const qualities = [];
-    if (piped.videoStreams) {
-      const seen = new Set();
-      piped.videoStreams
-        .filter(s => !s.videoOnly) // combined streams have audio
-        .sort((a, b) => (parseHeight(b.quality) || 0) - (parseHeight(a.quality) || 0))
-        .forEach(s => {
-          const h = parseHeight(s.quality);
-          if (h && !seen.has(h)) { seen.add(h); qualities.push({ height: h, label: qualityLabel(h) }); }
-        });
+  // ── YouTube: scrape page for reliable metadata ──────────
+  if (platform === 'youtube') {
+    const info = await scrapeYouTubeInfo(url);
+    if (!info) {
+      // Might be private/unavailable
+      return res.status(400).json({ error: 'Video privado, eliminado o no disponible' });
     }
+    // Fixed quality options — yt-dlp will pick best available at or below
+    const qualities = YT_COOKIES_FILE || !IS_HEADLESS
+      ? [
+          { height: 1080, label: 'Full HD (1080p)' },
+          { height: 720, label: 'HD (720p)' },
+          { height: 480, label: '480p' },
+          { height: 360, label: '360p' },
+        ]
+      : [
+          { height: 720, label: 'HD (720p)' },
+          { height: 480, label: '480p' },
+          { height: 360, label: '360p' },
+        ];
 
     return res.json({
       platform,
-      title: piped.title || 'Sin título',
-      thumbnail: piped.thumbnailUrl || null,
-      duration: formatDuration(piped.duration),
-      uploader: piped.uploader || null,
+      title: info.title,
+      thumbnail: info.thumbnail,
+      duration: formatDuration(info.duration),
+      uploader: info.uploader,
       qualities,
     });
   }
 
-  // ── Otras plataformas o YouTube local: usar yt-dlp ─────
+  // ── Other platforms: use yt-dlp ─────────────────────────
   const ytdlp = spawn('yt-dlp', [
     '--dump-json',
     ...getBaseArgs(platform),
@@ -232,35 +180,23 @@ app.get('/api/info', async (req, res) => {
   ytdlp.on('close', code => {
     if (code !== 0) {
       console.error(`[yt-dlp info error] ${errorOutput.slice(0, 300)}`);
-      const isBot = errorOutput.includes('Sign in') || errorOutput.includes('bot') || errorOutput.includes('confirm');
       const isPrivate = errorOutput.toLowerCase().includes('private');
       const isAuth = errorOutput.includes('login') || errorOutput.includes('Login') || errorOutput.includes('empty media');
       return res.status(400).json({
         error: isPrivate ? 'Video privado o no disponible'
-          : isBot ? 'YouTube está bloqueando el servidor. Configura las cookies de YouTube en Render.'
           : isAuth ? 'Este video requiere iniciar sesión'
           : 'No se pudo obtener información del video'
       });
     }
     try {
       const info = JSON.parse(output.trim().split('\n').pop());
-      const qualities = [];
-      if (platform === 'youtube' && info.formats) {
-        const seen = new Set();
-        info.formats
-          .filter(f => f.vcodec && f.vcodec !== 'none' && f.height)
-          .sort((a, b) => b.height - a.height)
-          .forEach(f => {
-            if (!seen.has(f.height)) { seen.add(f.height); qualities.push({ height: f.height, label: qualityLabel(f.height) }); }
-          });
-      }
       res.json({
         platform,
         title: info.title || 'Sin título',
         thumbnail: info.thumbnail || null,
         duration: formatDuration(info.duration),
         uploader: info.uploader || info.channel || null,
-        qualities
+        qualities: []
       });
     } catch { res.status(500).json({ error: 'Error procesando el video' }); }
   });
@@ -269,75 +205,12 @@ app.get('/api/info', async (req, res) => {
 // ══════════════════════════════════════════════════════════
 // POST /api/download
 // ══════════════════════════════════════════════════════════
-app.post('/api/download', async (req, res) => {
+app.post('/api/download', (req, res) => {
   const { url, type, quality } = req.body;
   if (!url || !validateUrl(url)) return res.status(400).json({ error: 'URL inválida' });
 
   const platform = detectPlatform(url);
   const isAudio = type === 'audio';
-
-  // ── YouTube en servidor: usar Piped API ─────────────────
-  if (platform === 'youtube' && IS_HEADLESS && !YT_COOKIES_FILE) {
-    const videoId = extractYouTubeId(url);
-    if (!videoId) return res.status(400).json({ error: 'URL de YouTube inválida' });
-
-    const piped = await getPipedStreams(videoId);
-    if (!piped) return res.status(500).json({ error: 'No se pudo obtener los streams del video' });
-
-    let streamUrl, ext, mimeType;
-
-    if (isAudio) {
-      // Best audio stream
-      const audio = (piped.audioStreams || [])
-        .sort((a, b) => (parseInt(b.bitrate) || 0) - (parseInt(a.bitrate) || 0))[0];
-      if (!audio) return res.status(500).json({ error: 'No se encontró stream de audio' });
-      streamUrl = audio.url;
-      mimeType = audio.mimeType || 'audio/mp4';
-      ext = mimeType.includes('webm') ? '.webm' : '.m4a';
-    } else {
-      // Combined (non-videoOnly) streams, pick closest quality
-      const videos = (piped.videoStreams || []).filter(s => !s.videoOnly);
-      if (!videos.length) return res.status(500).json({ error: 'No se encontró stream de video compatible' });
-
-      const target = quality ? parseInt(quality) : 9999;
-      videos.sort((a, b) => (parseHeight(b.quality) || 0) - (parseHeight(a.quality) || 0));
-      const best = videos.find(s => (parseHeight(s.quality) || 0) <= target) || videos[videos.length - 1];
-
-      streamUrl = best.url;
-      mimeType = best.mimeType || 'video/mp4';
-      ext = mimeType.includes('webm') ? '.webm' : '.mp4';
-    }
-
-    if (!isAllowedProxyUrl(streamUrl)) return res.status(500).json({ error: 'URL de stream inválida' });
-
-    try {
-      const upstream = await fetch(streamUrl, {
-        headers: {
-          'User-Agent': 'Mozilla/5.0 (Linux; Android 12; Pixel 6) AppleWebKit/537.36',
-          'Referer': 'https://www.youtube.com/',
-          'Origin': 'https://www.youtube.com',
-        },
-        signal: AbortSignal.timeout(60000),
-      });
-
-      if (!upstream.ok) return res.status(500).json({ error: 'Error al descargar el stream' });
-
-      const ct = upstream.headers.get('content-type') || mimeType;
-      const cl = upstream.headers.get('content-length');
-      res.setHeader('Content-Type', ct);
-      if (cl) res.setHeader('Content-Length', cl);
-      res.setHeader('Content-Disposition', `attachment; filename="descarga${ext}"`);
-
-      const { Readable } = require('stream');
-      Readable.fromWeb(upstream.body).pipe(res);
-    } catch (e) {
-      console.error('[Piped download]', e.message);
-      if (!res.headersSent) res.status(500).json({ error: 'Error al descargar el video' });
-    }
-    return;
-  }
-
-  // ── Otras plataformas o YouTube local: usar yt-dlp ─────
   const tmpId = crypto.randomBytes(10).toString('hex');
   const tmpDir = os.tmpdir();
   const outputTemplate = path.join(tmpDir, `ld_${tmpId}.%(ext)s`);
@@ -345,8 +218,8 @@ app.post('/api/download', async (req, res) => {
   const formatArg = isAudio
     ? 'bestaudio[ext=m4a]/bestaudio'
     : quality
-      ? `bestvideo[height<=${quality}]+bestaudio/best[height<=${quality}]/best`
-      : 'bestvideo+bestaudio/best';
+      ? `bestvideo[height<=${quality}][ext=mp4]+bestaudio[ext=m4a]/bestvideo[height<=${quality}]+bestaudio/best[height<=${quality}]/best`
+      : 'bestvideo[ext=mp4]+bestaudio[ext=m4a]/bestvideo+bestaudio/best';
 
   const args = [
     ...getBaseArgs(platform),
@@ -368,8 +241,17 @@ app.post('/api/download', async (req, res) => {
 
   ytdlp.on('close', code => {
     if (code !== 0) {
-      console.error(`[yt-dlp dl error] ${errorOutput.slice(0, 300)}`);
-      if (!res.headersSent) res.status(500).json({ error: 'Error al descargar el video' });
+      console.error(`[yt-dlp dl error] ${errorOutput.slice(0, 400)}`);
+      if (!res.headersSent) {
+        const isBlocked = errorOutput.includes('Sign in') || errorOutput.includes('bot')
+          || errorOutput.includes('confirm') || errorOutput.includes('HTTP Error 403');
+        res.status(isBlocked ? 403 : 500).json({
+          error: isBlocked
+            ? 'YouTube está bloqueando la descarga desde el servidor. Configura las cookies de YouTube para desbloquear.'
+            : 'Error al descargar el video',
+          needsCookies: isBlocked && platform === 'youtube',
+        });
+      }
       return;
     }
     const files = fs.readdirSync(tmpDir).filter(f => f.startsWith(`ld_${tmpId}`));

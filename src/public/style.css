@@ -536,3 +536,69 @@ body {
   .thumb-wrap { width: 110px; height: 70px; }
   .fmt-btn { padding: 8px 14px; font-size: 12px; }
 }
+
+/* ─── Cookies modal ───────────────────────────────────── */
+.modal-overlay {
+  position: fixed; inset: 0;
+  background: rgba(15,23,42,0.55);
+  backdrop-filter: blur(4px);
+  display: flex; align-items: center; justify-content: center;
+  z-index: 999;
+  padding: 20px;
+}
+.modal-box {
+  background: white;
+  border-radius: 20px;
+  padding: 32px 28px 28px;
+  max-width: 460px; width: 100%;
+  position: relative;
+  box-shadow: 0 20px 60px rgba(0,0,0,0.18);
+  max-height: 90vh; overflow-y: auto;
+}
+.modal-close {
+  position: absolute; top: 14px; right: 14px;
+  background: none; border: none; cursor: pointer;
+  color: #94A3B8; padding: 4px;
+  border-radius: 8px;
+  transition: color 0.15s, background 0.15s;
+}
+.modal-close:hover { color: #0F172A; background: #F1F5F9; }
+.modal-icon { font-size: 36px; text-align: center; margin-bottom: 12px; }
+.modal-title { font-size: 18px; font-weight: 900; text-align: center; margin-bottom: 8px; color: #0F172A; }
+.modal-desc { font-size: 13px; color: #64748B; text-align: center; margin-bottom: 20px; line-height: 1.5; }
+.cookie-steps {
+  list-style: none;
+  counter-reset: steps;
+  display: flex; flex-direction: column; gap: 12px;
+  margin-bottom: 24px;
+}
+.cookie-steps li {
+  counter-increment: steps;
+  display: flex; gap: 12px; align-items: flex-start;
+  font-size: 13px; color: #334155; line-height: 1.5;
+}
+.cookie-steps li::before {
+  content: counter(steps);
+  flex-shrink: 0;
+  width: 24px; height: 24px;
+  background: linear-gradient(135deg, #6366F1, #8B5CF6);
+  color: white; border-radius: 50%;
+  display: flex; align-items: center; justify-content: center;
+  font-size: 11px; font-weight: 800;
+}
+.cookie-steps li strong { display: block; color: #0F172A; font-weight: 800; margin-bottom: 2px; }
+.cookie-steps li em { font-style: normal; font-weight: 700; color: #6366F1; }
+.cookie-steps li code {
+  background: #F1F5F9; border-radius: 6px;
+  padding: 2px 6px; font-family: monospace; font-size: 12px;
+  color: #0F172A; font-weight: 700;
+}
+.btn-modal-ok {
+  width: 100%; padding: 13px;
+  background: linear-gradient(135deg, #6366F1, #8B5CF6);
+  color: white; border: none; border-radius: 12px;
+  font-size: 15px; font-weight: 800;
+  cursor: pointer; font-family: 'Nunito', sans-serif;
+  transition: opacity 0.15s;
+}
+.btn-modal-ok:hover { opacity: 0.9; }
