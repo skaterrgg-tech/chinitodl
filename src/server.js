@@ -1,56 +1,28 @@
 const express = require('express');
-const { spawn, execSync } = require('child_process');
+const { spawn } = require('child_process');
 const fs = require('fs');
 const path = require('path');
 const os = require('os');
 const crypto = require('crypto');
 
-// Fix PATH so yt-dlp and ffmpeg are always found regardless of how the app was launched
-process.env.PATH = [
-  '/opt/homebrew/bin',
-  '/opt/homebrew/sbin',
-  '/usr/local/bin',
-  '/usr/bin',
-  '/bin',
-  process.env.PATH
-].filter(Boolean).join(':');
+process.env.PATH = ['/opt/homebrew/bin', '/opt/homebrew/sbin', '/usr/local/bin', '/usr/bin', '/bin', process.env.PATH].filter(Boolean).join(':');
 
-// Platforms that require browser cookies for authentication
-const COOKIE_PLATFORMS = ['instagram', 'facebook'];
-
-// Detect installed browsers — prefer Chrome/Firefox (no sandbox issues on macOS)
-let _cachedBrowser = null;
-function getCookieBrowser() {
-  if (_cachedBrowser) return _cachedBrowser;
-  const candidates = [
-    { name: 'chrome',  path: '/Applications/Google Chrome.app' },
-    { name: 'firefox', path: '/Applications/Firefox.app' },
-    { name: 'brave',   path: '/Applications/Brave Browser.app' },
-    { name: 'chromium',path: '/Applications/Chromium.app' },
-    { name: 'safari',  path: '/Applications/Safari.app' },
-  ];
-  for (const { name, path: p } of candidates) {
-    if (fs.existsSync(p)) { _cachedBrowser = name; return name; }
-  }
-  return 'chrome';
-}
-
-// En servidor remoto no hay navegador — omitir cookies
 const IS_HEADLESS = process.env.HEADLESS === 'true';
-
-function getCookieArgs(platform) {
-  if (!COOKIE_PLATFORMS.includes(platform)) return [];
-  if (IS_HEADLESS) return []; // servidor sin navegador
-  return ['--cookies-from-browser', getCookieBrowser()];
-}
-
 const app = express();
 const PORT = process.env.PORT || 3000;
 
 app.use(express.json());
 app.use(express.static(path.join(__dirname, 'public')));
 
-// Allowed domains for security
+// ── YouTube cookies (Render env var YT_COOKIES) ────────────
+let YT_COOKIES_FILE = null;
+if (process.env.YT_COOKIES) {
+  YT_COOKIES_FILE = path.join(os.tmpdir(), 'yt_cookies.txt');
+  fs.writeFileSync(YT_COOKIES_FILE, process.env.YT_COOKIES);
+  console.log('✅ YouTube cookies cargadas');
+}
+
+// ── Helpers ────────────────────────────────────────────────
 const ALLOWED_DOMAINS = [
   'youtube.com', 'www.youtube.com', 'youtu.be', 'm.youtube.com',
   'instagram.com', 'www.instagram.com',
@@ -60,105 +32,113 @@ const ALLOWED_DOMAINS = [
 
 function validateUrl(url) {
   try {
-    const parsed = new URL(url);
-    if (!['http:', 'https:'].includes(parsed.protocol)) return false;
-    const hostname = parsed.hostname.toLowerCase();
-    return ALLOWED_DOMAINS.some(domain => hostname === domain);
-  } catch {
-    return false;
-  }
+    const p = new URL(url);
+    if (!['http:', 'https:'].includes(p.protocol)) return false;
+    return ALLOWED_DOMAINS.some(d => p.hostname.toLowerCase() === d);
+  } catch { return false; }
 }
 
 function detectPlatform(url) {
   try {
-    const hostname = new URL(url).hostname.toLowerCase();
-    if (hostname.includes('youtube') || hostname === 'youtu.be') return 'youtube';
-    if (hostname.includes('instagram')) return 'instagram';
-    if (hostname.includes('facebook') || hostname === 'fb.watch') return 'facebook';
-    if (hostname.includes('tiktok')) return 'tiktok';
+    const h = new URL(url).hostname.toLowerCase();
+    if (h.includes('youtube') || h === 'youtu.be') return 'youtube';
+    if (h.includes('instagram')) return 'instagram';
+    if (h.includes('facebook') || h === 'fb.watch') return 'facebook';
+    if (h.includes('tiktok')) return 'tiktok';
   } catch {}
   return null;
 }
 
-function formatDuration(seconds) {
-  if (!seconds) return '';
-  const h = Math.floor(seconds / 3600);
-  const m = Math.floor((seconds % 3600) / 60);
-  const s = Math.floor(seconds % 60);
-  if (h > 0) return `${h}:${String(m).padStart(2, '0')}:${String(s).padStart(2, '0')}`;
-  return `${m}:${String(s).padStart(2, '0')}`;
+function formatDuration(s) {
+  if (!s) return '';
+  const h = Math.floor(s / 3600), m = Math.floor((s % 3600) / 60), sec = Math.floor(s % 60);
+  return h > 0 ? `${h}:${String(m).padStart(2,'0')}:${String(sec).padStart(2,'0')}` : `${m}:${String(sec).padStart(2,'0')}`;
 }
 
-// GET /api/info - Fetch video metadata and available formats
+function qualityLabel(h) {
+  return h >= 2160 ? `4K (${h}p)` : h >= 1440 ? `2K (${h}p)` : h >= 1080 ? `Full HD (${h}p)` : h >= 720 ? `HD (${h}p)` : `${h}p`;
+}
+
+let _browser = null;
+function getCookieBrowser() {
+  if (_browser) return _browser;
+  for (const { name, p } of [
+    { name: 'chrome', p: '/Applications/Google Chrome.app' },
+    { name: 'firefox', p: '/Applications/Firefox.app' },
+    { name: 'brave', p: '/Applications/Brave Browser.app' },
+    { name: 'safari', p: '/Applications/Safari.app' },
+  ]) { if (fs.existsSync(p)) { _browser = name; return name; } }
+  return 'chrome';
+}
+
+// Devuelve los args de cookies según la plataforma y el entorno
+function getCookieArgs(platform) {
+  if (platform === 'youtube' && YT_COOKIES_FILE) {
+    return ['--cookies', YT_COOKIES_FILE];
+  }
+  if (['instagram', 'facebook'].includes(platform) && !IS_HEADLESS) {
+    return ['--cookies-from-browser', getCookieBrowser()];
+  }
+  return [];
+}
+
+// Args base de yt-dlp para evitar detección de bots
+function getBaseArgs(platform) {
+  const args = ['--no-playlist', '--no-warnings'];
+  if (platform === 'youtube') {
+    // mweb = cliente móvil, menos restricciones en IPs de servidor
+    args.push('--extractor-args', 'youtube:player_client=mweb,tv_embedded');
+    args.push('--user-agent', 'Mozilla/5.0 (Linux; Android 12; Pixel 6) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/112.0.0.0 Mobile Safari/537.36');
+  }
+  return args;
+}
+
+// ══════════════════════════════════════════════════════════
+// GET /api/info
+// ══════════════════════════════════════════════════════════
 app.get('/api/info', (req, res) => {
   const { url } = req.query;
-
-  if (!url || !validateUrl(url)) {
-    return res.status(400).json({ error: 'URL inválida o plataforma no soportada' });
-  }
+  if (!url || !validateUrl(url)) return res.status(400).json({ error: 'URL inválida o plataforma no soportada' });
 
   const platform = detectPlatform(url);
 
   const ytdlp = spawn('yt-dlp', [
     '--dump-json',
-    '--no-playlist',
-    '--no-warnings',
-    // Use TV/iOS client to bypass server-IP blocks from YouTube
-    ...(platform === 'youtube' ? ['--extractor-args', 'youtube:player_client=tv,ios,web'] : []),
+    ...getBaseArgs(platform),
     ...getCookieArgs(platform),
     url
   ]);
 
-  let output = '';
-  let errorOutput = '';
+  let output = '', errorOutput = '';
+  ytdlp.stdout.on('data', d => { output += d.toString(); });
+  ytdlp.stderr.on('data', d => { errorOutput += d.toString(); });
+  ytdlp.on('error', () => res.status(500).json({ error: 'yt-dlp no encontrado en el servidor' }));
 
-  ytdlp.stdout.on('data', (data) => { output += data.toString(); });
-  ytdlp.stderr.on('data', (data) => { errorOutput += data.toString(); });
-
-  ytdlp.on('error', () => {
-    res.status(500).json({
-      error: 'yt-dlp no está instalado. Instálalo con: pip install yt-dlp'
-    });
-  });
-
-  ytdlp.on('close', (code) => {
+  ytdlp.on('close', code => {
     if (code !== 0) {
-      const isAuthError = errorOutput.includes('empty media response') || errorOutput.includes('not granting access') || errorOutput.includes('login') || errorOutput.includes('Login');
-      const isPrivate   = errorOutput.includes('Private') || errorOutput.includes('private');
-      const browser     = getCookieBrowser();
-      const msg = isPrivate   ? 'Video privado o no disponible'
-        : isAuthError && COOKIE_PLATFORMS.includes(platform)
-          ? `Instagram requiere sesión activa. Inicia sesión en Instagram en ${browser === 'chrome' ? 'Google Chrome' : browser} e intenta de nuevo`
-        : errorOutput.includes('not find') ? 'yt-dlp no encontrado'
-        : 'No se pudo obtener información del video';
-      return res.status(400).json({ error: msg });
+      console.error(`[yt-dlp info error] ${errorOutput.slice(0, 300)}`);
+      const isBot = errorOutput.includes('Sign in') || errorOutput.includes('bot') || errorOutput.includes('confirm');
+      const isPrivate = errorOutput.toLowerCase().includes('private');
+      const isAuth = errorOutput.includes('login') || errorOutput.includes('Login') || errorOutput.includes('empty media');
+      return res.status(400).json({
+        error: isPrivate ? 'Video privado o no disponible'
+          : isBot ? 'YouTube está bloqueando el servidor. Configura las cookies de YouTube en Render.'
+          : isAuth ? 'Este video requiere iniciar sesión'
+          : 'No se pudo obtener información del video'
+      });
     }
-
     try {
       const info = JSON.parse(output.trim().split('\n').pop());
-
-      // Build quality options for YouTube
-      let qualities = [];
+      const qualities = [];
       if (platform === 'youtube' && info.formats) {
         const seen = new Set();
-        qualities = info.formats
+        info.formats
           .filter(f => f.vcodec && f.vcodec !== 'none' && f.height)
           .sort((a, b) => b.height - a.height)
-          .filter(f => {
-            if (seen.has(f.height)) return false;
-            seen.add(f.height);
-            return true;
-          })
-          .map(f => ({
-            height: f.height,
-            label: f.height >= 2160 ? `4K (${f.height}p)`
-              : f.height >= 1440 ? `2K (${f.height}p)`
-              : f.height >= 1080 ? `Full HD (${f.height}p)`
-              : f.height >= 720 ? `HD (${f.height}p)`
-              : `${f.height}p`
-          }));
+          .forEach(f => {
+            if (!seen.has(f.height)) { seen.add(f.height); qualities.push({ height: f.height, label: qualityLabel(f.height) }); }
+          });
       }
-
       res.json({
         platform,
         title: info.title || 'Sin título',
@@ -167,19 +147,16 @@ app.get('/api/info', (req, res) => {
         uploader: info.uploader || info.channel || null,
         qualities
       });
-    } catch {
-      res.status(500).json({ error: 'Error procesando la información del video' });
-    }
+    } catch { res.status(500).json({ error: 'Error procesando el video' }); }
   });
 });
 
-// POST /api/download - Download video and stream to client
+// ══════════════════════════════════════════════════════════
+// POST /api/download
+// ══════════════════════════════════════════════════════════
 app.post('/api/download', (req, res) => {
   const { url, type, quality } = req.body;
-
-  if (!url || !validateUrl(url)) {
-    return res.status(400).json({ error: 'URL inválida' });
-  }
+  if (!url || !validateUrl(url)) return res.status(400).json({ error: 'URL inválida' });
 
   const platform = detectPlatform(url);
   const isAudio = type === 'audio';
@@ -187,82 +164,53 @@ app.post('/api/download', (req, res) => {
   const tmpDir = os.tmpdir();
   const outputTemplate = path.join(tmpDir, `ld_${tmpId}.%(ext)s`);
 
-  let formatArg;
-  if (isAudio) {
-    formatArg = 'bestaudio[ext=m4a]/bestaudio';
-  } else if (quality) {
-    formatArg = `bestvideo[height<=${quality}]+bestaudio/best[height<=${quality}]/best`;
-  } else {
-    formatArg = 'bestvideo+bestaudio/best';
-  }
+  const formatArg = isAudio
+    ? 'bestaudio[ext=m4a]/bestaudio'
+    : quality
+      ? `bestvideo[height<=${quality}]+bestaudio/best[height<=${quality}]/best`
+      : 'bestvideo+bestaudio/best';
 
   const args = [
-    '--no-playlist',
-    '--no-warnings',
+    ...getBaseArgs(platform),
     '-f', formatArg,
     '-o', outputTemplate,
-    ...(platform === 'youtube' ? ['--extractor-args', 'youtube:player_client=tv,ios,web'] : []),
     ...getCookieArgs(platform)
   ];
 
   if (!isAudio) {
-    // Prefer H.264 + AAC (QuickTime/Safari compatible), fallback to re-encode if needed
-    args.push('-S', 'vcodec:h264,acodec:aac');
-    args.push('--merge-output-format', 'mp4');
-    args.push('--recode-video', 'mp4');
-    args.push('--postprocessor-args', 'ffmpeg:-movflags +faststart');
+    args.push('-S', 'vcodec:h264,acodec:aac', '--merge-output-format', 'mp4',
+      '--recode-video', 'mp4', '--postprocessor-args', 'ffmpeg:-movflags +faststart');
   }
-
   args.push(url);
 
   const ytdlp = spawn('yt-dlp', args);
   let errorOutput = '';
+  ytdlp.stderr.on('data', d => { errorOutput += d.toString(); });
+  ytdlp.on('error', () => { if (!res.headersSent) res.status(500).json({ error: 'yt-dlp no encontrado' }); });
 
-  ytdlp.stderr.on('data', (data) => { errorOutput += data.toString(); });
-
-  ytdlp.on('error', () => {
-    if (!res.headersSent) {
-      res.status(500).json({ error: 'yt-dlp no está instalado' });
-    }
-  });
-
-  ytdlp.on('close', (code) => {
+  ytdlp.on('close', code => {
     if (code !== 0) {
-      if (!res.headersSent) {
-        res.status(500).json({ error: 'Error al descargar el video' });
-      }
+      console.error(`[yt-dlp dl error] ${errorOutput.slice(0, 300)}`);
+      if (!res.headersSent) res.status(500).json({ error: 'Error al descargar el video' });
       return;
     }
-
     const files = fs.readdirSync(tmpDir).filter(f => f.startsWith(`ld_${tmpId}`));
-    if (files.length === 0) {
-      if (!res.headersSent) {
-        res.status(500).json({ error: 'Archivo de descarga no encontrado' });
-      }
-      return;
-    }
+    if (!files.length) { if (!res.headersSent) res.status(500).json({ error: 'Archivo no encontrado' }); return; }
 
     const filePath = path.join(tmpDir, files[0]);
     const ext = path.extname(files[0]).toLowerCase();
-    const contentType = isAudio
-      ? (ext === '.mp3' ? 'audio/mpeg' : ext === '.m4a' ? 'audio/mp4' : 'audio/webm')
-      : 'video/mp4';
+    const contentType = isAudio ? (ext === '.m4a' ? 'audio/mp4' : 'audio/mpeg') : 'video/mp4';
 
-    const stat = fs.statSync(filePath);
     res.setHeader('Content-Type', contentType);
-    res.setHeader('Content-Length', stat.size);
+    res.setHeader('Content-Length', fs.statSync(filePath).size);
     res.setHeader('Content-Disposition', `attachment; filename="descarga${ext}"`);
 
     const stream = fs.createReadStream(filePath);
     stream.pipe(res);
-
     const cleanup = () => fs.unlink(filePath, () => {});
     stream.on('end', cleanup);
     stream.on('error', cleanup);
-    res.on('close', () => { if (!res.writableEnded) cleanup(); });
   });
 });
 
-app.listen(PORT, () => {
-  console.log(`\n✅ LinkDownload corriendo en http://localhost:${PORT}\n`);
-});
+app.listen(PORT, () => console.log(`\n✅ ChinitoDownload en http://localhost:${PORT}\n`));
